@@ -1,0 +1,372 @@
+---
+title: "Contextual Bandits: LinUCB"
+author: "John Maxwell"
+date: "2017-03-17T11:19:00"
+bibliography: refs.bib
+---
+
+
+<p>I’ve been interested in contextual bandit algorithms lately so I thought I would document my experience as I explore the literature.</p>
+<div id="the-situation" class="section level1">
+<h1>The Situation</h1>
+<p>First, I will talk about the LinUCB algorithm with linear disjoint models, following <span class="citation">Li et al. (2010)</span>. I’m starting with this paper because it is the most cited paper on contextual bandits and I found it (sort of) easy to understand.</p>
+<p>In this paper, the authors focus on choosing which articles to put on the homepage of a site. Say, for example, they had 3 articles but only space for 1, they could use the LinUCB algorithm to find which of the articles is best. More interestingly, if they had some features about their users–say if they had clicked on a sports article in the past or if they had clicked on a politics article in the past–the algorithm can take that into account and find which articles are best for people given their past click behaviors.</p>
+<p>The family of UCB (upper confidence bound) algorithms have been well described in lots of places so I won’t spend time explaining those. You can read about them <a href="http://iosband.github.io/2015/07/19/Efficient-experimentation-and-multi-armed-bandits.html">here</a> and <a href="https://jeremykun.com/2013/10/28/optimism-in-the-face-of-uncertainty-the-ucb1-algorithm/">here</a>. However, we will make two assumptions: first, our observations are i.i.d. and second, the arms are independent.</p>
+<div id="simulating-data" class="section level3">
+<h3>Simulating Data</h3>
+<p>I’ll start by simulating data for this situation:</p>
+<pre class="r"><code>library(dplyr)
+library(broom)
+library(MASS)
+library(ggplot2)
+library(purrr)
+library(tidyr)
+library(knitr)
+
+# set number of observations
+n &lt;- 10000
+
+# make this reproducible
+set.seed(7)
+
+# simulate some data!
+bandit_data &lt;- data_frame(
+  clicked_sports = sample(c(0,1), n, prob = c(0.6, 0.4), replace = T),
+  clicked_politics = sample(c(0,1), n, prob = c(0.7, 0.3), replace = T),
+  arm = sample(c(1:3), n, replace =  T),
+  sports_coef = case_when(arm == 1 ~ .5,
+                          arm == 2 ~ .1,
+                          arm == 3 ~ .1),
+  politics_coef = case_when(arm == 1 ~ .1,
+                            arm == 2 ~ .1,
+                            arm == 3 ~ .4),
+  arm_baseline = case_when(arm == 1 ~ .1,
+                           arm == 2 ~ .2,
+                           arm == 3 ~ .1),
+  rand_draw = runif(n)
+) %&gt;%
+  mutate(click_factor = arm_baseline + sports_coef * clicked_sports + politics_coef * clicked_politics) %&gt;%
+  mutate(click = ifelse(click_factor &gt;= rand_draw, 1, 0)) %&gt;%
+  mutate(probability = 1/3) %&gt;%
+  mutate(
+    label1 = ifelse(arm == 1, 1, 0),
+    label2 = ifelse(arm == 2, 1, 0),
+    label3 = ifelse(arm == 3, 1, 0)
+  )
+
+#TO DO: remove for post, find other way to do this for TF post
+
+bandit_data %&gt;%
+  dplyr::select(clicked_sports,
+         clicked_politics,
+         click,
+         probability,
+         arm) -&gt; bandito
+  
+write.csv(bandito, file = &quot;~/Desktop/bandit_data.csv&quot;)</code></pre>
+<p>Let’s make sure that is doing what we want it to:</p>
+<pre class="r"><code>bandit_data %&gt;%
+  group_by(arm, clicked_sports, clicked_politics) %&gt;%
+  summarise(ct = n(), reward = sum(click), mean_clk_rt = mean(click)) %&gt;%
+  group_by(clicked_sports, clicked_politics) %&gt;%
+  filter(mean_clk_rt == max(mean_clk_rt)) %&gt;%
+  kable()</code></pre>
+<table>
+<thead>
+<tr class="header">
+<th align="right">arm</th>
+<th align="right">clicked_sports</th>
+<th align="right">clicked_politics</th>
+<th align="right">ct</th>
+<th align="right">reward</th>
+<th align="right">mean_clk_rt</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td align="right">1</td>
+<td align="right">1</td>
+<td align="right">0</td>
+<td align="right">963</td>
+<td align="right">560</td>
+<td align="right">0.5815161</td>
+</tr>
+<tr class="even">
+<td align="right">1</td>
+<td align="right">1</td>
+<td align="right">1</td>
+<td align="right">392</td>
+<td align="right">271</td>
+<td align="right">0.6913265</td>
+</tr>
+<tr class="odd">
+<td align="right">2</td>
+<td align="right">0</td>
+<td align="right">0</td>
+<td align="right">1450</td>
+<td align="right">286</td>
+<td align="right">0.1972414</td>
+</tr>
+<tr class="even">
+<td align="right">3</td>
+<td align="right">0</td>
+<td align="right">1</td>
+<td align="right">606</td>
+<td align="right">310</td>
+<td align="right">0.5115512</td>
+</tr>
+</tbody>
+</table>
+<p>So, we can see from this that arm 2 is best for people who clicked nothing, arm 3 is best when they clicked politics, and arm 1 is best when they clicked sports or if they clicked both. Let’s see if the LinUCB can figure this out!</p>
+</div>
+</div>
+<div id="the-algorithm" class="section level1">
+<h1>The Algorithm</h1>
+<p>Roughly, this is how the algorithm works: at each step, we run a linear regression with the data we have collected so far such that we have a coefficient for clicked_sports and clicked_politics. We then observe our new context (in this case the clicked_sports and clicked_politics variables), and generate a predicted payoff using our model. We also generate a confidence interval for that predicted payoff (i.e. click through rate) for each of the three arms. We then choose the arm with the highest upper confidence bound.</p>
+<div id="definitions" class="section level3">
+<h3>Definitions</h3>
+<p>To explain the details we need a few definitions:</p>
+<ul>
+<li><p><span class="math inline">\(d\)</span> is the number of features. In our case our features are clicked_politics and clicked_sports so <span class="math inline">\(d = 2\)</span>.</p></li>
+<li><p><span class="math inline">\(m\)</span> is the number of observations (in this case users) we have.</p></li>
+<li><p><span class="math inline">\(\mathbf{D}_a\)</span> is the <span class="math inline">\(m \times d\)</span> design matrix containing observations of our 2 variables for arm <span class="math inline">\(a\)</span>. It will look something like this:</p></li>
+</ul>
+<p><span class="math display">\[\begin{pmatrix}
+  1 &amp; 1\\
+  0 &amp; 1\\
+  1 &amp; 0\\
+  0 &amp; 0\\
+  \vdots &amp; \vdots
+\end{pmatrix}\]</span></p>
+<ul>
+<li><span class="math inline">\(\mathbf{c}_a\)</span> is the vector of length <span class="math inline">\(m\)</span> for arm <span class="math inline">\(a\)</span> containing 1 if someone clicked and 0 otherwise. It could look like this:</li>
+</ul>
+<p><span class="math display">\[\begin{pmatrix}
+  1\\
+  0\\
+  1\\
+  0\\
+  \vdots
+\end{pmatrix}\]</span></p>
+<ul>
+<li><span class="math inline">\(\hat{\boldsymbol\theta}_a\)</span> is the vector of length 2 of coefficients we obtain from applying ridge regression to <span class="math inline">\(\mathbf{D}_a\)</span> and <span class="math inline">\(\mathbf{c}_a\)</span>. The math for ridge regression is just like normal linear regression but with the <span class="math inline">\({\mathbf{I}_d}\)</span> added:</li>
+</ul>
+<p><span class="math display">\[\hat{\boldsymbol\theta}_a = \underbrace{(\mathbf{D}_a ^\intercal \mathbf{D}_a + \mathbf{I}_d)^{-1}\mathbf{D}_a ^\intercal\mathbf{c}_a}_\text{ridge regression}\]</span></p>
+<ul>
+<li><p>Following the authors and for convenience we will say that <span class="math inline">\(\mathbf{A}_a = \mathbf{D}_a ^\intercal \mathbf{D}_a + \mathbf{I}_d\)</span></p></li>
+<li><p><span class="math inline">\(\mathbf{x}_{t,a}\)</span> is a vector of length <span class="math inline">\(d\)</span> and is the context arm <span class="math inline">\(a\)</span> at time <span class="math inline">\(t\)</span>. In other words, it is one observation of our two variables–or a single row of <span class="math inline">\(\mathbf{D}_a\)</span>. So this could be the following or some other combination of 0 and 1:</p></li>
+</ul>
+<p><span class="math display">\[\begin{pmatrix}
+  1\\
+  0\\
+\end{pmatrix}\]</span></p>
+<ul>
+<li>Lastly, the crux of this algorithm: the arm we choose at each time (<span class="math inline">\(a_t\)</span>) is found by calculating which arm gives the largest predicted payoff from our ridge regression for our currently observed context (given by <span class="math inline">\(\mathbf{x}_{t,a}^\intercal\hat{\boldsymbol\theta}_a\)</span>) plus <span class="math inline">\(\alpha\)</span> times the standard deviation of the expected payoff. The variance of the payoff is given by <span class="math inline">\(\mathbf{x}_{t,a}^\intercal{\mathbf{A}_a}^{-1}\mathbf{x}_{t,a}\)</span>, so the standard deviation is just the square root of that:</li>
+</ul>
+<p><span class="math display">\[a_t = {argmax}_{a \in A_t} \Big( \underbrace{\mathbf{x}_{t,a}^\intercal\hat{\boldsymbol\theta}_a}_\text{predicted payoff} + {\alpha}\underbrace{\sqrt{\mathbf{x}_{t,a}^\intercal{\mathbf{A}_a}^{-1}\mathbf{x}_{t,a}}}_\text{standard deviation of payoff} \Big)\]</span></p>
+<ul>
+<li><p><span class="math inline">\({r_t}\)</span> is the payoff (clicked or didn’t) we observe after we choose an arm in time <span class="math inline">\(t\)</span>.</p></li>
+<li><p><span class="math inline">\(\mathbf{b}_a\)</span> is a vector of length <span class="math inline">\(d\)</span> that can be thought of as the <span class="math inline">\(\mathbf{D}_a ^\intercal\mathbf{c}_a\)</span> part of the ridge regression. We update it in every time period <span class="math inline">\(t\)</span> of the algorithm by by adding <span class="math inline">\(r_t \mathbf{x}_{t,a_a}\)</span> to it.</p></li>
+</ul>
+</div>
+<div id="putting-it-together" class="section level3">
+<h3>Putting It Together</h3>
+<p>Now that we have defined all the pieces we need, let’s put them together as the LinUCB algorithm:</p>
+<ol style="list-style-type: decimal">
+<li>Set <span class="math inline">\(\alpha\)</span></li>
+<li>Loop through every time period <span class="math inline">\(t\)</span> doing the following:
+<ol style="list-style-type: decimal">
+<li>Observe the context (<span class="math inline">\(\mathbf{x}_{t,a}\)</span>) and arms (<span class="math inline">\(a_t\)</span>).</li>
+<li>Loop through each arm doing this:
+<ol style="list-style-type: decimal">
+<li>If the arm hasn’t been seen yet:
+<ol style="list-style-type: decimal">
+<li>Instantiate <span class="math inline">\(\mathbf{A}_a\)</span> as a <span class="math inline">\(d \times d\)</span> identity matrix.</li>
+<li>Instantiate <span class="math inline">\(\mathbf{b}_a\)</span> as a 0 vector of length <span class="math inline">\(d\)</span>.</li>
+</ol></li>
+<li>Set <span class="math inline">\(\hat{\boldsymbol\theta}_a = \mathbf{A}_a^{-1}\mathbf{b}_a\)</span> (because remember that <span class="math inline">\(\mathbf{A}_a\)</span> is the first part of the ridge regression and <span class="math inline">\(\mathbf{b}_a\)</span> is the online variant of the second part).</li>
+<li>Find the expected payoff <span class="math inline">\(p_{t,a} = \mathbf{x}_{t,a}^\intercal\hat{\boldsymbol\theta}_a + {\alpha}\sqrt{\mathbf{x}_{t,a}^\intercal{\mathbf{A}_a}^{-1}\mathbf{x}_{t,a}}\)</span></li>
+</ol></li>
+<li>End the arm loop.</li>
+<li>Choose the arm with the biggest <span class="math inline">\(p_{t,a}\)</span> (if there is a tie pick randomly among the winners).</li>
+<li>Observe whether or not the user clicked: <span class="math inline">\(r_t\)</span>.</li>
+<li>Update <span class="math inline">\(\mathbf{A}_{a_t}\)</span> by adding <span class="math inline">\(\mathbf{x}_{t,a_a} \mathbf{x}_{t,a_a}^{\intercal}\)</span> to it.</li>
+<li>Update <span class="math inline">\(\mathbf{b}_a\)</span> by adding <span class="math inline">\({r_t} \mathbf{x}_{t,a_a}\)</span> to it.</li>
+</ol></li>
+<li>End the time period loop.</li>
+</ol>
+<p>This is simpler than it probably looks: in every time period, we find the upper end the confidence interval of the payoff for each arm, and we pick the arm with the highest one!</p>
+</div>
+<div id="how-it-looks-in-r" class="section level3">
+<h3>How it Looks in R</h3>
+<p>First, we need to set a parameter <span class="math inline">\(\alpha\)</span> to control how much exploration should happen vs. exploitation of the current best arm. For now I’m just arbitrarily choosing 7–ideally we would run simulations to determine the best value for this.</p>
+<pre class="r"><code>alpha = 7</code></pre>
+<p>Now we’ll need some functions:</p>
+<pre class="r"><code>library(MASS)
+
+# this function returns the ucb estimates or p_t_a from above
+inside_for_func &lt;- function(inverse_cov_matrix, reward_vector_times_design_matrix, context_vector, alpha){
+  theta_hat &lt;- inverse_cov_matrix %*% reward_vector_times_design_matrix
+  ucb_estimate &lt;- t(theta_hat) %*% context_vector + 
+    alpha * sqrt(t(context_vector) %*% inverse_cov_matrix %*% context_vector)
+  return(ucb_estimate)
+}
+
+# This function updates the covariate matrix
+update_cov_matrix &lt;- function(cov_matrix, context_vector){
+  return(cov_matrix + context_vector %*% t(context_vector))
+}
+
+# this one updates b_a from above
+update_reward_vector_times_design_matrix &lt;- function(reward_vector_times_design_matrix, reward, context_vector){
+  return(reward_vector_times_design_matrix + reward * context_vector)
+}</code></pre>
+<p>We need to give the algorithm some info and instantiate some objects:</p>
+<pre class="r"><code>arms &lt;- c(1:3)
+d &lt;- 2
+arm_choice &lt;- c()
+cov_matrix &lt;- list()
+reward_vector_times_design_matrix &lt;- list() # this corresponds to b_a above
+ucb_estimate &lt;- matrix(0, n, length(arms))</code></pre>
+<p>Now we should be ready! We can run this bandit algorithm on the fake data we created above by only keeping an observation when the bandit agrees on the arm choice of the randomized arm choices I set up in the initial dataset. This is actually a really simple technique one can use for training a contextual bandit before deploying it in production.</p>
+<p>The following is not written for efficiency–I’m trying to make it look as similar to the pseudocode as possible for readability.</p>
+<pre class="r"><code>for (t in 1:n){
+  context &lt;- bandit_data[t,]
+  for (a in arms){
+    if(t == 1){
+      cov_matrix[[a]] &lt;- diag(d)
+      reward_vector_times_design_matrix[[a]] &lt;- rep(0, d)
+    }
+    inverse_cov_matrix &lt;- ginv(cov_matrix[[a]])
+    ucb_estimate[t, a] &lt;- inside_for_func(inverse_cov_matrix, 
+                    as.matrix(reward_vector_times_design_matrix[[a]]), 
+                    as.matrix(c(context$clicked_sports, context$clicked_politics)), 
+                    alpha)
+  }
+  trial_arm &lt;- which(ucb_estimate[t,] == max(ucb_estimate[t,]))
+  if(length(trial_arm) &gt; 1){
+    trial_arm &lt;- sample(trial_arm, 1)
+  }
+  if(trial_arm == context$arm){
+    arm_choice[t] &lt;- trial_arm
+  }else{
+    arm_choice[t] &lt;- t*10 # need to do this so I can filter out unused observations from bandit dataset
+    next
+  }
+  cov_matrix[[arm_choice[t]]] &lt;- update_cov_matrix(cov_matrix[[arm_choice[t]]], 
+                                                as.matrix(c(context$clicked_sports, context$clicked_politics)))
+  reward_vector_times_design_matrix[[arm_choice[t]]] &lt;- update_reward_vector_times_design_matrix(
+    as.matrix(reward_vector_times_design_matrix[[arm_choice[t]]]),
+    context$click,
+    as.matrix(c(context$clicked_sports, context$clicked_politics))
+  )
+}</code></pre>
+</div>
+<div id="diagnostics" class="section level3">
+<h3>Diagnostics</h3>
+<p>How did our bandit do? Well, let’s see what we get for our coefficients when we just run a linear regression for each arm on our initial full dataset and compare that to what the bandit calculated:</p>
+<pre class="r"><code>bandit_data$arm_choice &lt;- arm_choice
+
+# create a function to apply to the list columns of the bandit data
+lm_fun &lt;- function(data){
+  return(tidy(summary(lm(click ~ 0 + clicked_sports + clicked_politics, data))))
+}
+
+# apply the lm function to each arm&#39;s data from the original dataset
+bandit_data %&gt;%
+  nest(-arm) %&gt;%
+  mutate(model = map(data, lm_fun)) %&gt;%
+  unnest(model) %&gt;%
+  dplyr::select(arm, term, data_estimate = estimate) %&gt;%
+  arrange(arm) -&gt; coefficients_from_data
+
+# calculate the coefficients for each of the arms using the bandit data
+map_df(arms, function(i) data_frame(arm = i, term = c(&quot;clicked_sports&quot;, &quot;clicked_politics&quot;), bandit_estimate = as.vector(ginv(cov_matrix[[i]]) %*% reward_vector_times_design_matrix[[i]]))) -&gt; coefficients_from_bandit
+
+# join them together and see how different they are
+coefficients_from_data %&gt;%
+  inner_join(coefficients_from_bandit, by = c(&quot;arm&quot;, &quot;term&quot;)) %&gt;%
+  mutate(percent_difference = 100*((bandit_estimate - data_estimate)/data_estimate)) -&gt; estimate_data</code></pre>
+<pre class="r"><code>kable(estimate_data)</code></pre>
+<table>
+<thead>
+<tr class="header">
+<th align="right">arm</th>
+<th align="left">term</th>
+<th align="right">data_estimate</th>
+<th align="right">bandit_estimate</th>
+<th align="right">percent_difference</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td align="right">1</td>
+<td align="left">clicked_sports</td>
+<td align="right">0.5667846</td>
+<td align="right">0.5837239</td>
+<td align="right">2.988670</td>
+</tr>
+<tr class="even">
+<td align="right">1</td>
+<td align="left">clicked_politics</td>
+<td align="right">0.1607319</td>
+<td align="right">0.1237742</td>
+<td align="right">-22.993414</td>
+</tr>
+<tr class="odd">
+<td align="right">2</td>
+<td align="left">clicked_sports</td>
+<td align="right">0.2690057</td>
+<td align="right">0.3025175</td>
+<td align="right">12.457671</td>
+</tr>
+<tr class="even">
+<td align="right">2</td>
+<td align="left">clicked_politics</td>
+<td align="right">0.2385999</td>
+<td align="right">0.1620305</td>
+<td align="right">-32.091124</td>
+</tr>
+<tr class="odd">
+<td align="right">3</td>
+<td align="left">clicked_sports</td>
+<td align="right">0.1769809</td>
+<td align="right">0.1107367</td>
+<td align="right">-37.430104</td>
+</tr>
+<tr class="even">
+<td align="right">3</td>
+<td align="left">clicked_politics</td>
+<td align="right">0.4658418</td>
+<td align="right">0.5079404</td>
+<td align="right">9.037109</td>
+</tr>
+</tbody>
+</table>
+<p>They look close-ish. It looks like the bandit is doing what it is supposed to: it gets the coefficients mostly correct for the good arms but learns less about the bad arms. That makes sense because it should try the bad ones less than any of the others. However, it looks like it hardly tried some of them at all which could be a bad thing. We may need to increase the value of alpha or set things up so the algorithm tries every option several times before it begins the convergence process. Now let’s see what the average reward was over time:</p>
+<pre class="r"><code>bandit_data %&gt;%
+  filter(arm_choice &lt; 10) %&gt;%
+  group_by(clicked_sports, clicked_politics, arm_choice) %&gt;%
+  mutate(total_reward = cumsum(click), trial = c(1:n())) %&gt;%
+  mutate(avg_reward = total_reward/trial) %&gt;%
+  ggplot(aes(x = trial, y = avg_reward, color = factor(arm), group = factor(arm))) +
+  geom_path() +
+  facet_wrap(~clicked_politics + clicked_sports, scales = &quot;free&quot;, labeller = &quot;label_both&quot;) +
+  theme_bw() +
+  scale_colour_grey()</code></pre>
+<p><img src="/post/2017-03-17_files/figure-html/unnamed-chunk-9-1.png" width="672" /></p>
+<p>As you can see, the algorithm eventually ends up giving an average reward close to the above coefficients from the original data. It stops trying arms that are clearly worse fairly quickly and takes longer in less obvious cases such as when users neither clicked on politics nor sports. In those cases it needs more data to be confident.</p>
+</div>
+</div>
+<div id="conclusions-and-next-steps" class="section level1">
+<h1>Conclusions and Next Steps</h1>
+<p>We’ve seen now how the LinUCB algorithm with linear disjoint models works. I hope I have helped make the ideas around this algorithm and its implementation easier to understand. If I haven’t and you need clarification leave a comment. Also, please let me know if you see any errors. I hope to continue these posts, the next one being the later part of this same paper–the hybrid LinUCB algorithm in which the authors allow arms to share contextual variables. After that I’m not sure which paper I will tackle–but I’m open to suggestions.</p>
+</div>
+<div id="references" class="section level1 unnumbered">
+<h1>References</h1>
+<div id="refs" class="references">
+<div id="ref-li2010contextual">
+<p>Li, Lihong, Wei Chu, John Langford, and Robert E Schapire. 2010. “A Contextual-Bandit Approach to Personalized News Article Recommendation.” In <em>Proceedings of the 19th International Conference on World Wide Web</em>, 661–70. ACM.</p>
+</div>
+</div>
+</div>
